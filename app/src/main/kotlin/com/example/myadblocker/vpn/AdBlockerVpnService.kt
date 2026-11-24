@@ -23,6 +23,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.DatagramPacket
@@ -36,6 +38,19 @@ class AdBlockerVpnService : VpnService() {
     private var vpnJob: Job? = null
     private var pauseJob: Job? = null
     private val writeLock = Any()
+    private val forwardSemaphore = Semaphore(32)
+
+    private data class DnsCacheEntry(
+        val response: ByteArray,
+        val expiresAtMs: Long
+    )
+
+    private val cacheLock = Any()
+    private val dnsCache = object : LinkedHashMap<String, DnsCacheEntry>(512, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, DnsCacheEntry>?): Boolean {
+            return size > MAX_DNS_CACHE_SIZE
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -217,7 +232,11 @@ class AdBlockerVpnService : VpnService() {
         try {
             while (serviceScope.isActive && vpnInterface != null) {
                 val length = input.read(buffer)
-                if (length <= 0) continue
+                if (length < 0) break
+                if (length == 0) {
+                    Thread.sleep(10)
+                    continue
+                }
 
                 val query = DnsPacketHandler.parseIpv4UdpDnsQuery(buffer, length) ?: continue
 
@@ -229,8 +248,18 @@ class AdBlockerVpnService : VpnService() {
                     val respPacket = DnsPacketHandler.buildResponseIpUdpPacket(query, blockedDns)
                     writeToTun(output, respPacket)
                 } else {
-                    serviceScope.launch {
-                        forwardDnsQuery(query, upstreamAddr, output)
+                    val cacheKey = "${query.domain.lowercase()}:${query.qType}"
+                    val cached = getCachedDnsResponse(cacheKey)
+                    if (cached != null) {
+                        val dnsResp = DnsPacketHandler.withTransactionId(cached, query.dnsPayload)
+                        val respPacket = DnsPacketHandler.buildResponseIpUdpPacket(query, dnsResp)
+                        writeToTun(output, respPacket)
+                    } else {
+                        serviceScope.launch {
+                            forwardSemaphore.withPermit {
+                                forwardDnsQuery(query, cacheKey, upstreamAddr, output)
+                            }
+                        }
                     }
                 }
             }
@@ -241,8 +270,28 @@ class AdBlockerVpnService : VpnService() {
         }
     }
 
+    private fun getCachedDnsResponse(cacheKey: String): ByteArray? {
+        val now = System.currentTimeMillis()
+        synchronized(cacheLock) {
+            val entry = dnsCache[cacheKey] ?: return null
+            if (entry.expiresAtMs < now) {
+                dnsCache.remove(cacheKey)
+                return null
+            }
+            return entry.response
+        }
+    }
+
+    private fun putCachedDnsResponse(cacheKey: String, response: ByteArray) {
+        val expiresAt = System.currentTimeMillis() + DNS_CACHE_TTL_MS
+        synchronized(cacheLock) {
+            dnsCache[cacheKey] = DnsCacheEntry(response, expiresAt)
+        }
+    }
+
     private fun forwardDnsQuery(
         query: ParsedDnsPacket,
+        cacheKey: String,
         upstreamAddr: InetAddress,
         output: FileOutputStream
     ) {
@@ -268,6 +317,7 @@ class AdBlockerVpnService : VpnService() {
             socket.receive(inPacket)
 
             val dnsResponse = respBuf.copyOfRange(0, inPacket.length)
+            putCachedDnsResponse(cacheKey, dnsResponse)
             val ipUdpResp = DnsPacketHandler.buildResponseIpUdpPacket(query, dnsResponse)
             writeToTun(output, ipUdpResp)
         } catch (e: Exception) {
@@ -345,6 +395,7 @@ class AdBlockerVpnService : VpnService() {
         } catch (_: Exception) {
         }
         vpnInterface = null
+        AdBlockerState.flushStats(this)
         AdBlockerState.setRunning(false)
         requestTileSync()
         stopForeground(STOP_FOREGROUND_REMOVE)
@@ -369,6 +420,8 @@ class AdBlockerVpnService : VpnService() {
         private const val VPN_ADDRESS = "10.0.0.2"
         private const val VPN_DNS = "10.0.0.1"
         private const val UPSTREAM_DNS = "1.1.1.1"
+        private const val MAX_DNS_CACHE_SIZE = 512
+        private const val DNS_CACHE_TTL_MS = 120_000L
 
         const val ACTION_START = "com.example.myadblocker.ACTION_START"
         const val ACTION_STOP = "com.example.myadblocker.ACTION_STOP"

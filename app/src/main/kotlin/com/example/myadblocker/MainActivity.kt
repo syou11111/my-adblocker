@@ -73,6 +73,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        AdBlockerState.syncLogsForUi()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         if (intent.action == ACTION_REQUEST_VPN) {

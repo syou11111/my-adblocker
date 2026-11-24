@@ -144,8 +144,8 @@ object DnsPacketHandler {
             buf.putShort(query.qType.toShort())
             // Class IN (1)
             buf.putShort(1)
-            // TTL (60s)
-            buf.putInt(60)
+            // TTL (300s to reduce repeated retries from ad SDKs)
+            buf.putInt(300)
             // RDLENGTH + RDATA (all zeros: 0.0.0.0 or ::)
             val rdLen = if (isA) 4 else 16
             buf.putShort(rdLen.toShort())
@@ -155,6 +155,18 @@ object DnsPacketHandler {
         }
 
         return resp
+    }
+
+    /**
+     * Clones a cached DNS response and replaces its Transaction ID with the query's ID.
+     */
+    fun withTransactionId(cachedDnsResponse: ByteArray, queryDnsPayload: ByteArray): ByteArray {
+        val copy = cachedDnsResponse.copyOf()
+        if (copy.size >= 2 && queryDnsPayload.size >= 2) {
+            copy[0] = queryDnsPayload[0]
+            copy[1] = queryDnsPayload[1]
+        }
+        return copy
     }
 
     /**

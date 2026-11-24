@@ -20,9 +20,14 @@ object AdBlockerState {
     private const val KEY_BLOCKED_COUNT = "blocked_count"
     private const val MAX_RECENT_LOGS = 50
     private const val MAX_DNS_LOGS = 200
+    private const val PREFS_FLUSH_INTERVAL = 20L
 
     private val timeFormatter = DateTimeFormatter.ofPattern("HH:mm:ss")
     private var logIdSeq = 0L
+    private var unsavedBlockIncrements = 0L
+
+    private val dnsLogBuffer = ArrayDeque<DnsLogEntry>(MAX_DNS_LOGS + 1)
+    private val recentBlockedBuffer = ArrayDeque<String>(MAX_RECENT_LOGS + 1)
 
     private val _isRunning = MutableStateFlow(false)
     val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -62,44 +67,78 @@ object AdBlockerState {
 
     fun recordDnsQuery(context: Context, domain: String, blocked: Boolean) {
         val now = LocalTime.now().format(timeFormatter)
-        val entry = synchronized(this) {
-            DnsLogEntry(
+        synchronized(this) {
+            val entry = DnsLogEntry(
                 id = ++logIdSeq,
                 domain = domain,
                 isBlocked = blocked,
                 timestamp = now
             )
-        }
-        _dnsLogs.update { current ->
-            (listOf(entry) + current).take(MAX_DNS_LOGS)
-        }
+            dnsLogBuffer.addFirst(entry)
+            if (dnsLogBuffer.size > MAX_DNS_LOGS) {
+                dnsLogBuffer.removeLast()
+            }
+            if (_dnsLogs.subscriptionCount.value > 0) {
+                _dnsLogs.value = dnsLogBuffer.toList()
+            }
 
-        if (blocked) {
-            _blockedCount.update { it + 1L }
-            val newCount = _blockedCount.value
-            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-                .edit()
-                .putLong(KEY_BLOCKED_COUNT, newCount)
-                .apply()
+            if (blocked) {
+                _blockedCount.update { it + 1L }
+                unsavedBlockIncrements++
+                if (unsavedBlockIncrements >= PREFS_FLUSH_INTERVAL) {
+                    flushStats(context)
+                }
 
-            _recentBlocked.update { current ->
-                (listOf(domain) + current).take(MAX_RECENT_LOGS)
+                recentBlockedBuffer.addFirst(domain)
+                if (recentBlockedBuffer.size > MAX_RECENT_LOGS) {
+                    recentBlockedBuffer.removeLast()
+                }
+                if (_recentBlocked.subscriptionCount.value > 0) {
+                    _recentBlocked.value = recentBlockedBuffer.toList()
+                }
             }
         }
     }
 
+    fun syncLogsForUi() {
+        synchronized(this) {
+            _dnsLogs.value = dnsLogBuffer.toList()
+            _recentBlocked.value = recentBlockedBuffer.toList()
+        }
+    }
+
+    fun flushStats(context: Context) {
+        synchronized(this) {
+            if (unsavedBlockIncrements == 0L) return
+            unsavedBlockIncrements = 0L
+            context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_BLOCKED_COUNT, _blockedCount.value)
+                .apply()
+        }
+    }
+
     fun clearLogs() {
-        _dnsLogs.value = emptyList()
-        _recentBlocked.value = emptyList()
+        synchronized(this) {
+            dnsLogBuffer.clear()
+            recentBlockedBuffer.clear()
+            _dnsLogs.value = emptyList()
+            _recentBlocked.value = emptyList()
+        }
     }
 
     fun resetStats(context: Context) {
-        _blockedCount.value = 0L
-        _recentBlocked.value = emptyList()
-        _dnsLogs.value = emptyList()
-        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-            .edit()
-            .putLong(KEY_BLOCKED_COUNT, 0L)
-            .apply()
+        synchronized(this) {
+            unsavedBlockIncrements = 0L
+            _blockedCount.value = 0L
+            dnsLogBuffer.clear()
+            recentBlockedBuffer.clear()
+            _recentBlocked.value = emptyList()
+            _dnsLogs.value = emptyList()
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_BLOCKED_COUNT, 0L)
+                .apply()
+        }
     }
 }
